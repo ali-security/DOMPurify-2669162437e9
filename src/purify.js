@@ -117,6 +117,12 @@ function createDOMPurify(window = getGlobal()) {
   const getAttributes = lookupGetter(ElementPrototype, 'attributes');
   const getNodeType =
     Node && Node.prototype ? lookupGetter(Node.prototype, 'nodeType') : null;
+  /* Only cache the shadowRoot getter where the engine implements Shadow DOM,
+     lookupGetter's fallback would otherwise warn for every element */
+  const getShadowRoot =
+    'shadowRoot' in ElementPrototype
+      ? lookupGetter(ElementPrototype, 'shadowRoot')
+      : null;
 
   // As per issue #47, the web-components registry is inherited by a
   // new document created via createHTMLDocument. As per the spec
@@ -1284,6 +1290,23 @@ function createDOMPurify(window = getGlobal()) {
         _sanitizeShadowDOM(shadowNode.content);
       }
 
+      /* An element iterated here may itself host an attached shadow root.
+         The NodeIterator does not enter shadow trees, so a shadow root
+         nested inside <template>.content was reached by no walk at all (the
+         template-content recursion above iterates the content but never
+         inspected shadowRoot), and its payload survived. Walk it explicitly.
+         The shadowRoot is read through the cached Element.prototype getter,
+         and only for element nodes, as the iterator also surfaces text and
+         comment nodes. CVE-2026-49978. */
+      if (getShadowRoot && _getNodeType(shadowNode) === 1) {
+        const innerShadowRoot = getShadowRoot(shadowNode);
+        if (_isDocumentFragment(innerShadowRoot)) {
+          innerShadowRoot.__depth = shadowNode.__depth;
+          _sanitizeAttachedShadowRoots(innerShadowRoot);
+          _sanitizeShadowDOM(innerShadowRoot);
+        }
+      }
+
       /* Check attributes, sanitize if necessary */
       _sanitizeAttributes(shadowNode);
     }
@@ -1291,6 +1314,58 @@ function createDOMPurify(window = getGlobal()) {
     /* Execute a hook if present */
     _executeHook('afterSanitizeShadowDOM', fragment, null);
   };
+  /**
+   * _sanitizeAttachedShadowRoots
+   *
+   * Walks `root` and feeds every attached shadow root it finds into
+   * _sanitizeShadowDOM. The node iterator does not descend into shadow
+   * trees, so an open shadow root attached to the IN_PLACE root or to any
+   * element below it (or deep-cloned by importNode() for a clonable shadow
+   * root) would otherwise never be sanitized. Runs once, before the main
+   * walk. Children are snapshotted first, as a hook may detach siblings.
+   * All reads go through the cached prototype getters, so a clobbering form
+   * descendant can not steer the walk. Upstream b4fdfe2e, e4790120.
+   * CVE-2026-49978.
+   *
+   * @param  {Node} root the subtree root to walk for attached shadow roots
+   */
+  const _sanitizeAttachedShadowRoots = function (root) {
+    if (!getShadowRoot) {
+      return;
+    }
+
+    const nodeType = _getNodeType(root);
+    if (nodeType === 1) {
+      const shadowRoot = getShadowRoot(root);
+      if (_isDocumentFragment(shadowRoot)) {
+        /* Recurse first so that nested shadow roots are reached even if
+           _sanitizeShadowDOM removes hosts at this level */
+        _sanitizeAttachedShadowRoots(shadowRoot);
+        _sanitizeShadowDOM(shadowRoot);
+      }
+    } else if (nodeType !== 9 && nodeType !== 11) {
+      return;
+    }
+
+    const childNodes = getChildNodes(root);
+    if (!childNodes) {
+      return;
+    }
+
+    const snapshot = [];
+    arrayForEach(childNodes, (child) => {
+      arrayPush(snapshot, child);
+    });
+    arrayForEach(snapshot, (child) => {
+      _sanitizeAttachedShadowRoots(child);
+    });
+
+    /* A <template> keeps its children in .content */
+    if (nodeType === 1 && _isDocumentFragment(root.content)) {
+      _sanitizeAttachedShadowRoots(root.content);
+    }
+  };
+
 
   /**
    * Sanitize
@@ -1441,6 +1516,14 @@ function createDOMPurify(window = getGlobal()) {
     /* Remove first element node (ours) if FORCE_BODY is set */
     if (body && FORCE_BODY) {
       _forceRemove(body.firstChild);
+    }
+
+    /* Sanitize attached shadow roots before the main walk, which does not
+       enter shadow trees. CVE-2026-49978 */
+    if (IN_PLACE) {
+      _sanitizeAttachedShadowRoots(dirty);
+    } else if (importedNode) {
+      _sanitizeAttachedShadowRoots(importedNode);
     }
 
     /* Get node iterator */
