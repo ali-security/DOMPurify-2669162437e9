@@ -819,6 +819,35 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _forkSharedAllowlist
+   * Fork a hook-mutable allowlist off its shared binding right before an
+   * uponSanitize* hook sees it. The per-walk clone in sanitize() samples the
+   * hooks once, before the walk, so a hook installed later in the walk (e.g.
+   * from beforeSanitizeElements) would otherwise get the module default or
+   * the setConfig() binding by reference and could widen it for good.
+   * Returns the set unchanged once it is call-local, so repeated calls are
+   * idempotent. Upstream 0332fe7c.
+   *
+   * @param  {String} entryPoint  Name of the uponSanitize* hook
+   * @param  {Object} set         Current ALLOWED_TAGS / ALLOWED_ATTR binding
+   * @param  {Object} defaultSet  DEFAULT_ALLOWED_TAGS / DEFAULT_ALLOWED_ATTR
+   * @param  {Object} pristineSet Binding captured by setConfig(), or null
+   * @return {Object} a call-local clone if needed, else set
+   */
+  const _forkSharedAllowlist = function (
+    entryPoint,
+    set,
+    defaultSet,
+    pristineSet
+  ) {
+    if (!_hasHooks(entryPoint)) {
+      return set;
+    }
+
+    return set === defaultSet || set === pristineSet ? clone(set) : set;
+  };
+
+  /**
    * _sanitizeElements
    *
    * @protect nodeName
@@ -843,6 +872,15 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Now let's check the element's type and name */
     const tagName = stringToLowerCase(currentNode.nodeName);
+
+    /* Fork ALLOWED_TAGS off a shared binding before a hook installed after
+       the per-walk clone can see it. CVE-2026-65902 */
+    ALLOWED_TAGS = _forkSharedAllowlist(
+      'uponSanitizeElement',
+      ALLOWED_TAGS,
+      DEFAULT_ALLOWED_TAGS,
+      PRISTINE_ALLOWED_TAGS
+    );
 
     /* Execute a hook if present */
     _executeHook('uponSanitizeElement', currentNode, {
@@ -1049,6 +1087,15 @@ function createDOMPurify(window = getGlobal()) {
     if (!attributes) {
       return;
     }
+
+    /* Same late-installed hook guard as for uponSanitizeElement.
+       CVE-2026-65902 */
+    ALLOWED_ATTR = _forkSharedAllowlist(
+      'uponSanitizeAttribute',
+      ALLOWED_ATTR,
+      DEFAULT_ALLOWED_ATTR,
+      PRISTINE_ALLOWED_ATTR
+    );
 
     const hookEvent = {
       attrName: '',
@@ -1305,22 +1352,26 @@ function createDOMPurify(window = getGlobal()) {
        * by a hook) does not carry over. */
       ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
       ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
-
-      /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
-       * allowedTags) and the uponSanitizeAttribute hook event exposes
-       * ALLOWED_ATTR (as allowedAttributes) by reference. Clone them before
-       * the walk whenever such a hook is registered, so a hook that widens
-       * them - documented in-call widening - only mutates this call's copy
-       * and never the persistent configuration. */
-      if (_hasHooks('uponSanitizeElement')) {
-        ALLOWED_TAGS = clone(ALLOWED_TAGS);
-      }
-
-      if (_hasHooks('uponSanitizeAttribute')) {
-        ALLOWED_ATTR = clone(ALLOWED_ATTR);
-      }
     } else {
       _parseConfig(cfg);
+    }
+
+    /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
+     * allowedTags) and the uponSanitizeAttribute hook event exposes
+     * ALLOWED_ATTR (as allowedAttributes) by reference. Without an explicit
+     * ALLOWED_TAGS / ALLOWED_ATTR those are the module-level defaults, so a
+     * hook that widens them would mutate the shared sets permanently, across
+     * later calls and even after removeAllHooks() / clearConfig(). Clone them
+     * per walk whenever such a hook is registered, so documented in-call
+     * widening only mutates this call's copy. A single guard for both config
+     * paths - the per-call path rebinds the sets in _parseConfig, the
+     * persistent path restores them from the pristine bindings above. */
+    if (_hasHooks('uponSanitizeElement')) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (_hasHooks('uponSanitizeAttribute')) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
     }
 
     /* Clean up removed elements */
